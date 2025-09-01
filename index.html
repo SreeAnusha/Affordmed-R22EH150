@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Client-side URL Shortener — Demo</title>
+  <style>
+    /* Minimal responsive styling */
+    :root { --bg:#f7fafc; --card:#fff; --muted:#666; --accent:#2b6cb0; }
+    body { margin:0; font-family: Inter, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial; background:var(--bg); color:#111; }
+    .container { max-width:980px; margin:28px auto; padding:18px; }
+    header { display:flex; justify-content:space-between; gap:12px; align-items:center; }
+    h1 { margin:0; font-size:20px; }
+    p.lead { margin:4px 0 0; color:var(--muted); font-size:13px; }
+    nav button { margin-left:8px; padding:6px 10px; border-radius:6px; border:1px solid #e6e6e6; background:#fff; cursor:pointer; }
+    nav button[disabled] { opacity:.5; cursor:default; }
+    .card { background:var(--card); border:1px solid #e6e6e6; padding:14px; border-radius:10px; margin-top:16px; }
+    .grid { display:grid; gap:12px; }
+    .row { border:1px solid #f0f0f0; padding:10px; border-radius:8px; }
+    label { display:block; font-size:13px; margin-bottom:6px; color:#333; }
+    input[type=text], input[type=number] { width:100%; padding:8px 10px; border-radius:8px; border:1px solid #ddd; font-size:14px; }
+    .controls { display:flex; gap:8px; margin-top:8px; }
+    button.primary { background:var(--accent); color:white; border:none; padding:8px 12px; border-radius:8px; cursor:pointer; }
+    button.ghost { background:#f9fafb; border:1px solid #e6e6e6; padding:8px 12px; border-radius:8px; cursor:pointer; }
+    .muted { color:var(--muted); font-size:13px; }
+    .result { padding:10px; border:1px solid #eee; border-radius:8px; }
+    @media (min-width:880px){ .two-col { display:flex; gap:12px; } .left { flex:1 } .right{ width:340px } }
+  </style>
+  <!-- React UMD builds and Babel (for in-browser JSX) -->
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- App code: type="text/babel" so Babel transpiles JSX in browser (fine for dev/demo only) -->
+  <script type="text/babel">
+    const { useState, useEffect, useMemo, useRef } = React;
+
+    // ---------- Storage key ----------
+    const STORAGE_KEY = 'urlshort:v3';
+
+    // ---------- Utilities ----------
+    function loadLinks() {
+      try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); }
+      catch (e) { console.error(e); return []; }
+    }
+    function saveLinks(links) {
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(links)); }
+      catch (e) { console.error(e); }
+    }
+    function isValidUrl(u) {
+      if (!u || typeof u !== 'string') return false;
+      try { const parsed = new URL(u); return parsed.protocol === 'http:' || parsed.protocol === 'https:'; }
+      catch (e) { return false; }
+    }
+    function sanitizeCode(code) { return (code||'').replace(/[^0-9A-Za-z_-]/g, '').trim(); }
+    function randomCode(len = 6) {
+      const chars = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+      const arr = new Uint8Array(len); window.crypto.getRandomValues(arr);
+      return Array.from(arr).map(n => chars[n % chars.length]).join('');
+    }
+    function now() { return Date.now(); }
+    function fmt(ts) { return ts ? new Date(ts).toLocaleString() : '—'; }
+    function deviceMeta() {
+      const ua = navigator.userAgent || '';
+      const lower = ua.toLowerCase();
+      const os = /windows/.test(lower) ? 'Windows' : /mac os|macintosh/.test(lower) ? 'macOS' : /android/.test(lower) ? 'Android' : /iphone|ipad|ipod/.test(lower) ? 'iOS' : /linux/.test(lower) ? 'Linux' : 'Other';
+      return { isMobile: /mobile|iphone|android/.test(lower), os, lang: navigator.language || 'en', tz: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC', screen: `${window.screen?.width||'?'}x${window.screen?.height||'?'}` };
+    }
+
+    // ---------- Backend placeholder (replace with API call in production) ----------
+    async function submitToBackend(batch) {
+      // In production: call your server endpoint here (POST /shorten)
+      await new Promise(r => setTimeout(r, 450));
+      const created = batch.map(item => {
+        const code = item.preferredCode || randomCode(6);
+        const createdAt = now();
+        const expiryTs = item.validityMinutes ? createdAt + item.validityMinutes * 60000 : null;
+        return { code, longUrl: item.longUrl, createdAt, expiryTs, visits: [] };
+      });
+      return { success: true, created };
+    }
+
+    // ---------- Hash redirect handler ----------
+    function handlePotentialRedirect(onBeforeRedirect) {
+      const hash = window.location.hash.replace(/^#\/?/, '');
+      const match = hash.match(/^r\/(.+)$/);
+      if (!match) return false;
+      const code = decodeURIComponent(match[1]);
+      const links = loadLinks();
+      const link = links.find(l => l.code === code);
+      if (!link) return false;
+      try {
+        const meta = deviceMeta();
+        const visit = { ts: now(), ref: document.referrer || '(direct)', ...meta };
+        link.visits = link.visits || []; link.visits.push(visit);
+        link.lastAccessed = visit.ts;
+        saveLinks(links);
+      } catch(e) { console.warn('visit record failed', e); }
+      onBeforeRedirect && onBeforeRedirect(link);
+      window.location.replace(link.longUrl);
+      return true;
+    }
+
+    // ---------- React app ----------
+    function App() {
+      const [links, setLinks] = useState(() => loadLinks());
+      const [tab, setTab] = useState('shorten');
+      const [rows, setRows] = useState([{ longUrl:'', validityMinutes:'', preferredCode:'', errors:{} }]);
+      const [creating, setCreating] = useState(false);
+      const [createdBatch, setCreatedBatch] = useState([]);
+      const mountedRef = useRef(true);
+
+      useEffect(() => { mountedRef.current = true; const redirected = handlePotentialRedirect(); function onHash(){ handlePotentialRedirect(); } window.addEventListener('hashchange', onHash); return ()=> { mountedRef.current = false; window.removeEventListener('hashchange', onHash); }; }, []);
+
+      useEffect(()=> saveLinks(links), [links]);
+
+      function setRow(idx, patch) { setRows(prev => prev.map((r,i)=>i===idx?{...r,...patch}:r)); }
+      function addRow(){ if (rows.length>=5) return; setRows(prev=>[...prev,{ longUrl:'', validityMinutes:'', preferredCode:'', errors:{} }]); }
+      function removeRow(idx){ setRows(prev=>prev.filter((_,i)=>i!==idx)); }
+
+      function validateSingle(row, existingCodesLower) {
+        const errs = {};
+        if (!isValidUrl(row.longUrl)) errs.longUrl = 'Provide a valid http(s) URL.';
+        if (row.validityMinutes !== '') {
+          const v = Number(row.validityMinutes);
+          if (!Number.isInteger(v) || v <= 0) errs.validityMinutes = 'Validity must be a positive integer (minutes).';
+        }
+        if (row.preferredCode) {
+          const sc = sanitizeCode(row.preferredCode);
+          if (!sc) errs.preferredCode = 'Preferred shortcode must use letters, numbers, - or _.';
+          else if (existingCodesLower.has(sc.toLowerCase())) errs.preferredCode = 'That shortcode is already taken.';
+        }
+        return errs;
+      }
+
+      async function onSubmit(e) {
+        e && e.preventDefault();
+        const existing = new Set(links.map(l=>l.code.toLowerCase()));
+        const validated = rows.map(r=>({...r, errors: validateSingle(r, existing)}));
+        setRows(validated);
+        const hasError = validated.some(r => Object.keys(r.errors||{}).length>0);
+        if (hasError) return alert('Please fix validation errors first.');
+        const batch = validated.map(r=>({ longUrl: r.longUrl.trim(), validityMinutes: r.validityMinutes === '' ? null : Number(r.validityMinutes), preferredCode: sanitizeCode(r.preferredCode) || null }));
+        setCreating(true);
+        try {
+          const resp = await submitToBackend(batch);
+          if (!resp || !resp.success) throw new Error('Server error');
+          const created = resp.created;
+          const merged = [...created, ...links];
+          setLinks(merged);
+          setCreatedBatch(created);
+          setRows([{ longUrl:'', validityMinutes:'', preferredCode:'', errors:{} }]);
+          alert('Created ' + created.length + ' short link(s).');
+        } catch (err) { console.error(err); alert('Failed: ' + (err.message || err)); } finally { if (mountedRef.current) setCreating(false); }
+      }
+
+      function expiryText(l) {
+        if (!l.expiryTs) return 'Never';
+        const nowTs = now();
+        if (l.expiryTs <= nowTs) return `Expired at ${fmt(l.expiryTs)}`;
+        const minsLeft = Math.round((l.expiryTs - nowTs)/60000);
+        return `Expires at ${fmt(l.expiryTs)} (${minsLeft} minutes left)`;
+      }
+
+      const stats = useMemo(() => {
+        const total = links.length; const nowTs = now();
+        const active = links.filter(l => !l.expiryTs || l.expiryTs > nowTs).length;
+        const expired = total - active;
+        const clicks = links.reduce((s,l)=> s + (l.visits?.length||0), 0);
+        const top = [...links].sort((a,b)=> (b.visits?.length||0) - (a.visits?.length||0)).slice(0,5);
+        const recent = links.flatMap(l => (l.visits||[]).map(v => ({...v, code: l.code}))).sort((a,b)=> b.ts - a.ts).slice(0,10);
+        return { total, active, expired, clicks, top, recent };
+      }, [links]);
+
+      function purgeExpired(){ const n=now(); setLinks(prev => prev.filter(l => !l.expiryTs || l.expiryTs > n)); }
+
+      return (
+        <div className="container">
+          <header>
+            <div>
+              <h1>URL Shortener — Batch create (up to 5)</h1>
+              <p className="lead">Create shortcodes with optional expiry and preferred shortcode. Runs fully in your browser for demo/testing.</p>
+            </div>
+            <nav>
+              <button onClick={()=>setTab('shorten')} disabled={tab==='shorten'}>Shorten</button>
+              <button onClick={()=>setTab('stats')} disabled={tab==='stats'}>Statistics</button>
+            </nav>
+          </header>
+
+          <main>
+            {tab==='shorten' && (
+              <form onSubmit={onSubmit} className="card">
+                <div className="grid">
+                  {rows.map((row, idx) => (
+                    <div className="row" key={idx}>
+                      <div style={{display:'flex', justifyContent:'space-between', alignItems:'center'}}>
+                        <strong>Entry {idx+1}</strong>
+                        <div>
+                          {rows.length>1 && <button type="button" onClick={()=>removeRow(idx)} className="ghost" style={{marginRight:8}}>Remove</button>}
+                          {idx === rows.length-1 && rows.length<5 && <button type="button" onClick={addRow} className="ghost">Add</button>}
+                        </div>
+                      </div>
+
+                      <div style={{marginTop:8}}>
+                        <label>Long URL
+                          <input type="text" value={row.longUrl} onChange={(e)=>setRow(idx,{longUrl:e.target.value})} placeholder="https://example.com/very/long/path" />
+                        </label>
+                        {row.errors.longUrl && <div style={{color:'crimson'}}>{row.errors.longUrl}</div>}
+
+                        <div style={{display:'flex', gap:8, marginTop:8}}>
+                          <label style={{flex:1}}>Validity (minutes, optional)
+                            <input type="text" value={row.validityMinutes} onChange={(e)=>setRow(idx,{validityMinutes:e.target.value})} placeholder="e.g., 60" />
+                            {row.errors.validityMinutes && <div style={{color:'crimson'}}>{row.errors.validityMinutes}</div>}
+                          </label>
+                          <label style={{flex:1}}>Preferred shortcode (optional)
+                            <input type="text" value={row.preferredCode} onChange={(e)=>setRow(idx,{preferredCode:e.target.value})} placeholder="alphanumeric, - or _" />
+                            {row.errors.preferredCode && <div style={{color:'crimson'}}>{row.errors.preferredCode}</div>}
+                          </label>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+
+                  <div className="controls">
+                    <button className="primary" type="submit" disabled={creating}>{creating ? 'Creating...' : 'Create short links'}</button>
+                    <button type="button" className="ghost" onClick={()=>{ setRows([{ longUrl:'', validityMinutes:'', preferredCode:'', errors:{} }]); setCreatedBatch([]); }}>Reset</button>
+                    <button type="button" className="ghost" onClick={()=>setRows(prev => prev.slice(0,1))}>Collapse to 1</button>
+                  </div>
+
+                  {createdBatch.length>0 && (
+                    <section style={{marginTop:8}}>
+                      <h3>Created links</h3>
+                      <div style={{display:'grid', gap:8}}>
+                        {createdBatch.map(l => (
+                          <div className="result" key={l.code}>
+                            <div><strong>Short:</strong> <a target="_blank" rel="noreferrer" href={`${window.location.origin}${window.location.pathname}#/r/${encodeURIComponent(l.code)}`}>{`${window.location.origin}${window.location.pathname}#/r/${encodeURIComponent(l.code)}`}</a></div>
+                            <div><strong>Original:</strong> {l.longUrl}</div>
+                            <div><strong>Expiry:</strong> {l.expiryTs ? fmt(l.expiryTs) : 'None'}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </section>
+                  )}
+                </div>
+              </form>
+            )}
+
+            {tab==='stats' && (
+              <div className="card">
+                <div className="two-col">
+                  <div className="left">
+                    <h2>Statistics</h2>
+                    <div className="muted">Totals & quick controls</div>
+                    <div style={{display:'flex', gap:12, marginTop:8}}>
+                      <div style={{minWidth:200}}>
+                        <div><strong>Total links:</strong> {stats.total}</div>
+                        <div><strong>Active:</strong> {stats.active}</div>
+                        <div><strong>Expired:</strong> {stats.expired}</div>
+                        <div><strong>Total clicks:</strong> {stats.clicks}</div>
+                        <div style={{marginTop:8}}><button className="ghost" onClick={purgeExpired}>Purge expired</button></div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="right">
+                    <h3>Top links</h3>
+                    {stats.top.length===0 ? <div className="muted">No links yet</div> : (
+                      <ol>
+                        {stats.top.map(l => (
+                          <li key={l.code} style={{marginBottom:8}}>
+                            <div><strong>{l.code}</strong> — {l.longUrl}</div>
+                            <div>Clicks: {l.visits?.length || 0} · {expiryText(l)}</div>
+                          </li>
+                        ))}
+                      </ol>
+                    )}
+                  </div>
+                </div>
+
+                <div style={{marginTop:12}}>
+                  <h3>Recent visits</h3>
+                  {stats.recent.length===0 ? <div className="muted">No visits</div> : (
+                    <table style={{width:'100%', borderCollapse:'collapse'}}>
+                      <thead>
+                        <tr><th style={{borderBottom:'1px solid #ddd'}}>Time</th><th style={{borderBottom:'1px solid #ddd'}}>Code</th><th style={{borderBottom:'1px solid #ddd'}}>Ref / Meta</th></tr>
+                      </thead>
+                      <tbody>
+                        {stats.recent.map((v,i)=>(
+                          <tr key={i}><td style={{padding:'6px 4px'}}>{fmt(v.ts)}</td><td style={{padding:'6px 4px'}}>{v.code}</td><td style={{padding:'6px 4px'}}>{v.ref} · {v.os} · {v.lang}</td></tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+
+              </div>
+            )}
+          </main>
+
+          <footer style={{marginTop:12, color:'#666', fontSize:13}}>
+            <div>Note: This demo stores links and analytics in your browser's localStorage. For multi-user persistence, wire the placeholder <code>submitToBackend</code> to your server API.</div>
+          </footer>
+        </div>
+      );
+    }
+
+    // Render the app
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
